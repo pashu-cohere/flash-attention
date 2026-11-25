@@ -52,7 +52,9 @@ from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.block_sparse_utils import (
     get_total_block_count,
     produce_block_sparse_loads_sm100,
+    produce_block_sparse_loads_sm100_dense_order,
     softmax_block_sparse_sm100,
+    softmax_block_sparse_sm100_dense_order,
     handle_block_sparse_empty_tile_correction_sm100,
 )
 from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
@@ -165,8 +167,15 @@ class FlashAttentionForwardSm100:
         seqlen_k_per_split: Optional[int] = None,
         *,
         config: FwdConfig,
+        block_sparse_dense_order: bool = False,
+        block_sparse_kv_offsets: bool = False,
     ):
-        """config is a validated SM100/SM110 FwdConfig; the kernel copies its fields."""
+        """config is a validated SM100/SM110 FwdConfig; the kernel copies its fields.
+
+        block_sparse_dense_order walks the block-sparse lists in the dense kernels' order, see
+        NOTE [Block-sparse dense order] in block_sparse_utils.py. block_sparse_kv_offsets reads
+        each list entry as the key offset its block starts at, see NOTE [Block-sparse key offsets].
+        """
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -227,6 +236,8 @@ class FlashAttentionForwardSm100:
         self.use_correction_warps_for_epi = not self.use_tma_O
         self.q_subtile_factor = q_subtile_factor
         self.kv_subtile_factor = kv_subtile_factor
+        self.block_sparse_dense_order = block_sparse_dense_order
+        self.block_sparse_kv_offsets = block_sparse_kv_offsets
         assert (
             not self.is_split_kv or self.head_dim_v_padded < 192 or self.chunked_split_epi
         ), "SplitKV is not supported for hdim_v >= 192 except 256"
@@ -798,6 +809,21 @@ class FlashAttentionForwardSm100:
             head_divmod = FastDivmodDivisorV2(self.qhead_per_kvhead)
 
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
+        if cutlass.const_expr(self.use_block_sparsity and self.block_sparse_dense_order):
+            assert self.kv_subtile_factor == 1 and not self.is_split_kv, (
+                "block_sparse_dense_order needs kv_subtile_factor == 1 and no SplitKV"
+            )
+        if cutlass.const_expr(self.block_sparse_kv_offsets):
+            assert self.use_block_sparsity and self.block_sparse_dense_order and self.use_tma_KV, (
+                "block_sparse_kv_offsets needs block sparsity, block_sparse_dense_order and TMA K/V"
+            )
+            assert self.score_mod is None, "block_sparse_kv_offsets does not offset score_mod indices"
+            # Only the mask_mod paths cut a partial block at its key count.
+            assert self.mask_mod is not None and not (self.is_causal or self.is_local), (
+                "block_sparse_kv_offsets needs a mask_mod and no is_causal / is_local"
+            )
+            # The varlen layout holds ceil(seqlen_k / tile_n) entries per m block, too few for key offsets.
+            assert len(blocksparse_tensors.mask_block_cnt.shape) != 2, "block_sparse_kv_offsets needs batched lists"
         if cutlass.const_expr(self.use_block_sparsity and self.use_s_ping_pong):
             raise NotImplementedError("Block sparsity + S ping-pong not supported on SM100")
         if cutlass.const_expr(self.use_block_sparsity and mPageTable is not None):
@@ -872,6 +898,7 @@ class FlashAttentionForwardSm100:
             qhead_per_kvhead_packgqa=(
                 self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
             ),
+            n_block_is_kv_offset=self.block_sparse_kv_offsets,
         )
 
     #  GPU device kernel
@@ -1634,6 +1661,10 @@ class FlashAttentionForwardSm100:
                 tKsK, tKgK = None, None
                 tVsV, tVgV = None, None
 
+            k_tile_at, v_tile_at = None, None
+            if const_expr(self.block_sparse_kv_offsets):
+                k_tile_at = partial(self.kv_tile_at, tma_atom_K, mK_cur, sK, thr_mma_qk, K_or_V="K")
+                v_tile_at = partial(self.kv_tile_at, tma_atom_V, mV_cur, sV, thr_mma_pv, K_or_V="V")
             load_K = partial(
                 self.load_KV,
                 tma_atom_K,
@@ -1643,6 +1674,7 @@ class FlashAttentionForwardSm100:
                 sK,
                 pipeline_kv=pipeline_kv,
                 K_or_V="K",
+                tile_at=k_tile_at,
             )
             load_V = partial(
                 self.load_KV,
@@ -1654,6 +1686,7 @@ class FlashAttentionForwardSm100:
                 pipeline_kv=pipeline_kv,
                 K_or_V="V",
                 tma_desc_ptr=v_desc_ptr,
+                tile_at=v_tile_at,
             )
 
             if const_expr(not self.use_block_sparsity):
@@ -1743,25 +1776,42 @@ class FlashAttentionForwardSm100:
                 if const_expr(self.is_split_kv and block_info.pack_split_idx):
                     num_splits_dyn = split_idx >> 16
                     split_idx = split_idx & 0xFFFF
-                kv_producer_state, q_producer_phase = produce_block_sparse_loads_sm100(
-                    blocksparse_tensors,
-                    batch_idx,
-                    head_idx,
-                    work_m,
-                    seqlen,
-                    split_idx,
-                    num_splits_dyn,
-                    kv_producer_state,
-                    load_Q,
-                    load_K,
-                    load_V,
-                    pipeline_kv,
-                    self.q_stage,
-                    q_producer_phase,
-                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor,
-                    self.kv_subtile_factor,
-                )
+                if const_expr(self.block_sparse_dense_order):
+                    kv_producer_state, q_producer_phase = produce_block_sparse_loads_sm100_dense_order(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        work_m,
+                        seqlen,
+                        kv_producer_state,
+                        load_Q,
+                        load_K,
+                        load_V,
+                        self.q_stage,
+                        q_producer_phase,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        self.q_subtile_factor,
+                    )
+                else:
+                    kv_producer_state, q_producer_phase = produce_block_sparse_loads_sm100(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        work_m,
+                        seqlen,
+                        split_idx,
+                        num_splits_dyn,
+                        kv_producer_state,
+                        load_Q,
+                        load_K,
+                        load_V,
+                        pipeline_kv,
+                        self.q_stage,
+                        q_producer_phase,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        self.q_subtile_factor,
+                        self.kv_subtile_factor,
+                    )
 
             if is_scheduler_producer:
                 tile_scheduler.prefetch_next_work()
@@ -2458,34 +2508,59 @@ class FlashAttentionForwardSm100:
                     check_m_boundary = m_tile_end > seqlen.seqlen_q
                 else:
                     check_m_boundary = False
-                (
-                    s_p_o_consumer_count,
-                    sm_stats_producer_phase,
-                    s0_s1_sequence_phase,
-                    empty_tile,
-                ) = softmax_block_sparse_sm100(
-                    blocksparse_tensors,
-                    batch_idx,
-                    head_idx,
-                    work_m,
-                    seqlen,
-                    split_idx,
-                    num_splits_dyn,
-                    softmax_step,
-                    mask_fn,
-                    mask_fn_none,
-                    s_p_o_consumer_count,
-                    sm_stats_producer_phase,
-                    s0_s1_sequence_phase,
-                    pipeline_sm_stats,
-                    sm_stats_barrier,
-                    self.q_stage,
-                    Int32(stage),
-                    check_m_boundary,
-                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor,
-                    self.kv_subtile_factor,
-                )
+                if const_expr(self.block_sparse_dense_order):
+                    (
+                        s_p_o_consumer_count,
+                        sm_stats_producer_phase,
+                        s0_s1_sequence_phase,
+                        empty_tile,
+                    ) = softmax_block_sparse_sm100_dense_order(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        work_m,
+                        seqlen,
+                        softmax_step,
+                        mask_fn,
+                        mask_fn_none,
+                        s_p_o_consumer_count,
+                        sm_stats_producer_phase,
+                        s0_s1_sequence_phase,
+                        sm_stats_barrier,
+                        Int32(stage),
+                        check_m_boundary,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        self.q_subtile_factor,
+                    )
+                else:
+                    (
+                        s_p_o_consumer_count,
+                        sm_stats_producer_phase,
+                        s0_s1_sequence_phase,
+                        empty_tile,
+                    ) = softmax_block_sparse_sm100(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        work_m,
+                        seqlen,
+                        split_idx,
+                        num_splits_dyn,
+                        softmax_step,
+                        mask_fn,
+                        mask_fn_none,
+                        s_p_o_consumer_count,
+                        sm_stats_producer_phase,
+                        s0_s1_sequence_phase,
+                        pipeline_sm_stats,
+                        sm_stats_barrier,
+                        self.q_stage,
+                        Int32(stage),
+                        check_m_boundary,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        self.q_subtile_factor,
+                        self.kv_subtile_factor,
+                    )
                 if not empty_tile:
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
@@ -3539,7 +3614,9 @@ class FlashAttentionForwardSm100:
         page_idx: Optional[Int32] = None,
         extra_tx_count: Optional[Int32] = None,
         tma_desc_ptr: Optional[cute.Pointer] = None,
+        tile_at: Optional[Callable] = None,
     ):
+        """tile_at (block_sparse_kv_offsets): block packs the tile's first key, see AttentionMask.kv_start."""
         assert K_or_V in ("K", "V")
         stage, phase = producer_state.index, producer_state.phase
         extra_tx_count_kv = self.tma_copy_bytes[K_or_V] - self.tma_copy_bytes["K"]
@@ -3562,7 +3639,10 @@ class FlashAttentionForwardSm100:
                 # Since this is the producer_state, the phase starts at 1, so we have to invert it
                 tXsX_cur = self.offset_kv_smem(tXsX_cur, stage, phase ^ 1)
             # Currently we assume that page_size == n_block_size so we index into tXgX with block = 0
-            tXgX_cur = tXgX[None, block] if const_expr(page_idx is None) else tXgX[None, 0, page_idx]
+            if const_expr(tile_at is not None):
+                tXgX_cur = tile_at(kv_start=block // self.n_block_size)
+            else:
+                tXgX_cur = tXgX[None, block] if const_expr(page_idx is None) else tXgX[None, 0, page_idx]
             desc_kwargs = {"tma_desc_ptr": tma_desc_ptr} if const_expr(tma_desc_ptr is not None) else {}
             cute.copy(
                 tma_atom, tXgX_cur, tXsX_cur,
@@ -3577,6 +3657,38 @@ class FlashAttentionForwardSm100:
             paged_kv_manager.load_KV(block, sX_cur, K_or_V)
             cute.arch.cp_async_commit_group()
             pipeline_kv.sync_object_full.arrive_cp_async_mbarrier(stage)
+
+    @cute.jit
+    def kv_tile_at(
+        self,
+        tma_atom: cute.CopyAtom,
+        mX_cur: cute.Tensor,
+        sX: cute.Tensor,
+        thr_mma: cute.ThrMma,
+        kv_start: Int32,
+        K_or_V: cutlass.Constexpr[str],
+    ) -> cute.Tensor:
+        """TMA source of the n_block_size keys from key kv_start, which need not be a tile multiple."""
+        if const_expr(K_or_V == "K"):
+            gX = cute.local_tile(
+                cute.domain_offset((kv_start, 0), mX_cur),
+                cute.select(self.mma_tiler_qk, mode=[1, 2]),
+                (0, 0),
+            )
+        else:
+            gX = cute.local_tile(
+                cute.domain_offset((0, kv_start), mX_cur),
+                cute.select(self.mma_tiler_pv, mode=[1, 2]),
+                (0, 0),
+            )
+        _, tXgX = cpasync.tma_partition(
+            tma_atom,
+            0,  # no multicast
+            cute.make_layout(1),
+            cute.group_modes(sX, 0, 3),
+            cute.group_modes(thr_mma.partition_B(gX), 0, 3),
+        )
+        return tXgX
 
     @cute.jit
     def offset_kv_smem(self, sX: cute.Tensor, stage: Int32, phase: Int32):

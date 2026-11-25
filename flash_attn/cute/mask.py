@@ -164,6 +164,19 @@ class AttentionMask:
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1  # only pass in if we're doing PackGQA
     swap_AB: cutlass.Constexpr[bool] = False
+    # The SM100 forward's n_block packs the block's first key and key count, key * tile_n + count - 1, instead
+    # of a tile index (block_sparse_kv_offsets).
+    n_block_is_kv_offset: cutlass.Constexpr[bool] = False
+
+    def kv_start(self, n_block):
+        """The first key of block n_block."""
+        return n_block // self.tile_n if const_expr(self.n_block_is_kv_offset) else n_block * self.tile_n
+
+    def kv_end(self, n_block):
+        """One past the last key of block n_block that the mask keeps."""
+        if const_expr(self.n_block_is_kv_offset):
+            return cutlass.min(self.seqlen_k, n_block // self.tile_n + n_block % self.tile_n + 1)
+        return self.seqlen_k
 
     @property
     def seqlen_q(self) -> Int32:
@@ -456,7 +469,7 @@ class AttentionMask:
             row_coord = tScS_t2r[i][0] if not self.swap_AB else tScS_t2r[i][1]
             col_coord = tScS_t2r[i][1] if not self.swap_AB else tScS_t2r[i][0]
             global_row = row_coord + m_block * self.tile_m
-            global_col = col_coord + n_block * self.tile_n
+            global_col = col_coord + self.kv_start(n_block)
 
             if const_expr(self.qhead_per_kvhead_packgqa != 1):
                 assert head_divmod is not None
@@ -488,8 +501,8 @@ class AttentionMask:
             )
             cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
             acc_S[i] = acc_S[i] if cond else -Float32.inf
-            if const_expr(mask_seqlen):
-                acc_S[i] = -Float32.inf if global_col >= self.seqlen_k else acc_S[i]
+            if const_expr(mask_seqlen or self.n_block_is_kv_offset):
+                acc_S[i] = -Float32.inf if global_col >= self.kv_end(n_block) else acc_S[i]
             if check_q_boundary:
                 acc_S[i] = -Float32.inf if mask_row >= self.seqlen_q else acc_S[i]
 
@@ -537,7 +550,7 @@ class AttentionMask:
             row_coord = tScS_t2r[i][0] if not self.swap_AB else tScS_t2r[i][1]
             col_coord = tScS_t2r[i][1] if not self.swap_AB else tScS_t2r[i][0]
             global_row = row_coord + m_block * self.tile_m
-            global_col = col_coord + n_block * self.tile_n
+            global_col = col_coord + self.kv_start(n_block)
             if const_expr(self.qhead_per_kvhead_packgqa != 1):
                 assert head_divmod is not None
                 mask_row, head_offset = divmod(global_row, head_divmod)
@@ -562,7 +575,7 @@ class AttentionMask:
             # Build the per-lane KV indices for this vectorized mask_mod call.
             for j in cutlass.range_constexpr(min(vec_size, ncol - i)):
                 col_j_coord = tScS_t2r[i + j][1] if not self.swap_AB else tScS_t2r[i + j][0]
-                col_j_global = col_j_coord + n_block * self.tile_n
+                col_j_global = col_j_coord + self.kv_start(n_block)
                 col_j_for_mod = col_j_global
                 if const_expr(has_fastdiv and mask_seqlen and aux_data.tensors is not None):
                     _, col_j_for_mod = divmod(col_j_global, fastdiv_mods[1])
@@ -582,8 +595,9 @@ class AttentionMask:
 
             # For vec_size < 32, multiple mask_mod calls fill one R2P chunk.
             bit_offset = const_expr((s % calls_per_apply) * vec_size)
+            limit_cols = const_expr(mask_seqlen or self.n_block_is_kv_offset)
             seqlen_thresh_call = (
-                self.seqlen_k - global_col if const_expr(mask_seqlen) else cutlass.Int32(0)
+                self.kv_end(n_block) - global_col if const_expr(limit_cols) else cutlass.Int32(0)
             )
             q_in_bounds = mask_row < self.seqlen_q if check_q_boundary else cutlass.Boolean(True)
             for c in cutlass.range_constexpr(mask_vals_per_apply):
@@ -594,7 +608,7 @@ class AttentionMask:
                         cutlass.Uint32(32 - vec_size),
                     )
                     mask_val = mask_val & lane_keep
-                if const_expr(mask_seqlen):
+                if const_expr(limit_cols):
                     mask_val = mask_val & r2p_bitmask_below(seqlen_thresh_call, c)
                 if check_q_boundary:
                     mask_val = mask_val if q_in_bounds else cutlass.Uint32(0)
@@ -644,7 +658,7 @@ class AttentionMask:
         # TODO: find more transparent solution
         if n_block < 0:
             n_block = 0
-        seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n
+        seqlenk_col_limit = self.kv_end(n_block) - self.kv_start(n_block)
 
         if const_expr(rBitmask is not None):
             ncol_packed = const_expr(cute.size(rBitmask.shape[0]))
@@ -711,7 +725,7 @@ class AttentionMask:
                 )
 
         else:  # Causal or local
-            causal_row_offset = self.seqlen_k - n_block * self.tile_n - self.seqlen_q
+            causal_row_offset = self.seqlen_k - self.kv_start(n_block) - self.seqlen_q
             row_idx = tScS_t2r[0][0] + m_block * self.tile_m
             if const_expr(self.qhead_per_kvhead_packgqa != 1):
                 row_idx = row_idx // self.qhead_per_kvhead_packgqa
@@ -759,7 +773,7 @@ class AttentionMask:
                         cutlass.min(row_idx, self.seqlen_q - 1)
                     ]
                     col_limit_left = cutlass.max(
-                        col_limit_left, row_kv_start - n_block * self.tile_n
+                        col_limit_left, row_kv_start - self.kv_start(n_block)
                     )
                 if const_expr(not r2p):
                     # if cute.arch.thread_idx()[0] == 0 or cute.arch.thread_idx()[0] == 128: cute.printf("m_block = {}, n_block = {}, row_idx = {}, causal_row_offset = {}, col_limit_right = {}, col_limit_left = {}", m_block, n_block, row_idx, causal_row_offset, col_limit_right, col_limit_left)

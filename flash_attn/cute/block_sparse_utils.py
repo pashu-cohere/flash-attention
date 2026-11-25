@@ -9,7 +9,7 @@ from typing import Callable, Optional, Tuple
 from functools import partial
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, const_expr
+from cutlass import Boolean, Float32, Int32, const_expr
 
 from quack import copy_utils
 
@@ -788,6 +788,141 @@ def produce_block_sparse_loads_sm100(
     return kv_producer_state, q_producer_phase
 
 
+# NOTE [Block-sparse dense order]
+# By default the SM100 forward walks a Q tile's partial (mask) list and then its full list, each right to
+# left. The dense kernels walk every KV block right to left, and the online softmax rounds differently in
+# the two orders. With block_sparse_dense_order the load and softmax warps merge the two ascending lists
+# into one right-to-left pass, walked run by run, so the output matches the dense kernels bit for bit. A
+# run of partial blocks gets the mask_mod variant and a run of full blocks the one the full-list loop gets.
+# Only the first block visited masks seqlen_k: the lists must hold no block past seqlen_k other than the last
+# KV block, which holds when the block mask is built for the same seqlen_k. The MMA and correction warps only
+# count blocks.
+
+# NOTE [Block-sparse key offsets]
+# With block_sparse_kv_offsets (needs block_sparse_dense_order) each list entry packs the key its block
+# starts at and how many of its keys the block owns, key * tile_n + count - 1, instead of a tile index, so
+# blocks can start anywhere: a varlen kernel cuts each document's keys into tiles from the document's first
+# key, and lists of those blocks give its bits on packed rows. The load warp reads the tile_n keys from that
+# key, and the mask places columns at key + column and masks every partial block's columns past its count
+# and past seqlen_k, so a block never passes on the next document's keys. Entries ascend as tile indices do.
+# A full block must own all tile_n keys. The mask_mod sees keys up to seqlen_k + tile_n - 2 on any block, so
+# its aux tensors must cover them (tax pads doc_ids by tile_n). Batched lists only, with a mask_mod.
+
+
+@cute.jit
+def next_block_dense_order(
+    mask_block_idx: cute.Tensor,
+    full_block_idx: Optional[cute.Tensor],
+    mask_left: Int32,
+    full_left: Int32,
+):
+    """Take the next block right to left across both ascending lists.
+
+    Returns (n_block, is_partial, mask_left, full_left) with the taken list's count decremented.
+    """
+    n_mask = Int32(-1)
+    n_full = Int32(-1)
+    if mask_left > 0:
+        n_mask = mask_block_idx[mask_left - 1]
+    if const_expr(full_block_idx is not None):
+        if full_left > 0:
+            n_full = full_block_idx[full_left - 1]
+    is_partial = n_mask > n_full
+    n_block = n_full
+    if is_partial:
+        n_block = n_mask
+        mask_left -= 1
+    else:
+        full_left -= 1
+    return n_block, is_partial, mask_left, full_left
+
+
+@cute.jit
+def list_tails(
+    mask_block_idx: cute.Tensor,
+    full_block_idx: Optional[cute.Tensor],
+    mask_left: Int32,
+    full_left: Int32,
+):
+    """The largest block left in each ascending list, -1 for an exhausted list."""
+    n_mask = Int32(-1)
+    n_full = Int32(-1)
+    if mask_left > 0:
+        n_mask = mask_block_idx[mask_left - 1]
+    if const_expr(full_block_idx is not None):
+        if full_left > 0:
+            n_full = full_block_idx[full_left - 1]
+    return n_mask, n_full
+
+
+@cute.jit
+def produce_block_sparse_loads_sm100_dense_order(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    m_block,
+    seqlen_info: SeqlenInfoQK,
+    kv_producer_state,
+    load_Q,
+    load_K,
+    load_V,
+    q_stage: cutlass.Constexpr,
+    q_producer_phase: Int32,
+    qhead_per_kvhead: cutlass.Constexpr,
+    q_subtile_factor: cutlass.Constexpr,
+):
+    """produce_block_sparse_loads_sm100 in the dense order, see NOTE [Block-sparse dense order].
+
+    Q loads with the first block, as there. No SplitKV and kv_subtile_factor == 1.
+    """
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
+    mask_cnt, mask_idx, full_cnt, full_idx = get_curr_blocksparse_tensors(
+        batch_idx, head_idx, m_block_sparse, blocksparse_tensors, seqlen_info
+    )
+    if const_expr(full_idx is None):
+        full_cnt = Int32(0)
+    if mask_cnt + full_cnt > 0:
+        n_block, _, mask_left, full_left = next_block_dense_order(
+            mask_idx, full_idx, mask_cnt, full_cnt
+        )
+        load_Q(block=0, stage=0)
+        if const_expr(q_stage == 2):
+            load_Q(block=1, stage=1)
+        load_K(block=n_block, producer_state=kv_producer_state, page_idx=None)
+        kv_producer_state.advance()
+        load_V(block=n_block, producer_state=kv_producer_state, page_idx=None)
+        kv_producer_state.advance()
+        while mask_left + full_left > 0:
+            n_mask, n_full = list_tails(mask_idx, full_idx, mask_left, full_left)
+            if n_mask > n_full:
+                n_block = n_mask
+                more = Boolean(True)
+                while more:
+                    n_next = mask_idx[cutlass.max(mask_left - 2, 0)]
+                    load_K(block=n_block, producer_state=kv_producer_state, page_idx=None)
+                    kv_producer_state.advance()
+                    load_V(block=n_block, producer_state=kv_producer_state, page_idx=None)
+                    kv_producer_state.advance()
+                    mask_left -= 1
+                    more = (mask_left > 0) & (n_next > n_full)
+                    n_block = n_next
+            else:
+                if const_expr(full_idx is not None):
+                    n_block = n_full
+                    more = Boolean(True)
+                    while more:
+                        n_next = full_idx[cutlass.max(full_left - 2, 0)]
+                        load_K(block=n_block, producer_state=kv_producer_state, page_idx=None)
+                        kv_producer_state.advance()
+                        load_V(block=n_block, producer_state=kv_producer_state, page_idx=None)
+                        kv_producer_state.advance()
+                        full_left -= 1
+                        more = (full_left > 0) & (n_next > n_mask)
+                        n_block = n_next
+        q_producer_phase ^= 1
+    return kv_producer_state, q_producer_phase
+
+
 @cute.jit
 def get_total_block_count(
     blocksparse_tensors: BlockSparseTensors,
@@ -1142,6 +1277,145 @@ def softmax_block_sparse_sm100(
         si_corr_producer_phase,
         s0_s1_sequence_phase,
         total_block_cnt == 0,
+    )
+
+
+@cute.jit
+def softmax_block_sparse_sm100_dense_order(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    m_block,
+    seqlen_info: SeqlenInfoQK,
+    softmax_step: Callable,
+    mask_fn: Callable,
+    mask_fn_none: Callable,
+    mma_si_consumer_phase: Int32,
+    si_corr_producer_phase: Int32,
+    s0_s1_sequence_phase: Int32,
+    sm_stats_barrier: cutlass.pipeline.NamedBarrier,
+    stage_idx: Int32,
+    check_m_boundary: bool,
+    qhead_per_kvhead: cutlass.Constexpr,
+    q_subtile_factor: cutlass.Constexpr[int] = 1,
+):
+    """softmax_block_sparse_sm100 in the dense order, see NOTE [Block-sparse dense order].
+
+    The first block masks seqlen_k, standing in for the first block of each list there; with the precondition
+    in the NOTE, only the last KV block can reach past seqlen_k and it is always taken first. The rest goes run
+    by run: the partial blocks
+    above the next full one, then the full blocks above the next partial one, and so on, so each run's loop
+    keeps one mask variant like the two loops of softmax_block_sparse_sm100 and loads one index per block.
+    """
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
+    mask_cnt, mask_idx, full_cnt, full_idx = get_curr_blocksparse_tensors(
+        batch_idx, head_idx, m_block_sparse, blocksparse_tensors, seqlen_info
+    )
+    if const_expr(full_idx is None):
+        full_cnt = Int32(0)
+    total = mask_cnt + full_cnt
+    if total == 0:
+        sm_stats_barrier.arrive_w_index(index=stage_idx * 4 + warp_idx)
+    else:
+        n_block, is_partial, mask_left, full_left = next_block_dense_order(
+            mask_idx, full_idx, mask_cnt, full_cnt
+        )
+        if is_partial:
+            (
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+            ) = softmax_step(
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+                n_block,
+                is_first=True,
+                mask_fn=partial(mask_fn, mask_seqlen=True, check_q_boundary=check_m_boundary),
+            )
+        else:
+            (
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+            ) = softmax_step(
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+                n_block,
+                is_first=True,
+                mask_fn=partial(mask_fn_none, mask_seqlen=True, check_q_boundary=check_m_boundary),
+            )
+        mask_inner = partial(mask_fn, mask_seqlen=False, check_q_boundary=check_m_boundary)
+        full_inner = (
+            None
+            if const_expr(check_m_boundary is False)
+            else partial(mask_fn_none, mask_seqlen=False, check_q_boundary=check_m_boundary)
+        )
+        while mask_left + full_left > 0:
+            n_mask, n_full = list_tails(mask_idx, full_idx, mask_left, full_left)
+            if n_mask > n_full:
+                n_block = n_mask
+                more = Boolean(True)
+                while more:
+                    n_next = mask_idx[cutlass.max(mask_left - 2, 0)]
+                    (
+                        mma_si_consumer_phase,
+                        si_corr_producer_phase,
+                        s0_s1_sequence_phase,
+                    ) = softmax_step(
+                        mma_si_consumer_phase,
+                        si_corr_producer_phase,
+                        s0_s1_sequence_phase,
+                        n_block,
+                        mask_fn=mask_inner,
+                    )
+                    mask_left -= 1
+                    more = (mask_left > 0) & (n_next > n_full)
+                    n_block = n_next
+            else:
+                if const_expr(full_idx is not None):
+                    if mask_left == 0:
+                        # Only full blocks are left: one counted run, no index read to find its end.
+                        for i in cutlass.range(full_left):
+                            (
+                                mma_si_consumer_phase,
+                                si_corr_producer_phase,
+                                s0_s1_sequence_phase,
+                            ) = softmax_step(
+                                mma_si_consumer_phase,
+                                si_corr_producer_phase,
+                                s0_s1_sequence_phase,
+                                full_idx[full_left - 1 - i],
+                                mask_fn=full_inner,
+                            )
+                        full_left = 0
+                    else:
+                        n_block = n_full
+                        more = Boolean(True)
+                        while more:
+                            n_next = full_idx[cutlass.max(full_left - 2, 0)]
+                            (
+                                mma_si_consumer_phase,
+                                si_corr_producer_phase,
+                                s0_s1_sequence_phase,
+                            ) = softmax_step(
+                                mma_si_consumer_phase,
+                                si_corr_producer_phase,
+                                s0_s1_sequence_phase,
+                                n_block,
+                                mask_fn=full_inner,
+                            )
+                            full_left -= 1
+                            more = (full_left > 0) & (n_next > n_mask)
+                            n_block = n_next
+
+    return (
+        mma_si_consumer_phase,
+        si_corr_producer_phase,
+        s0_s1_sequence_phase,
+        total == 0,
     )
 
 
